@@ -1,0 +1,9 @@
+megatron:
+  - role: teacher
+    name: teacher_0
+    overrides:
+      load: /mnt/amedelastic-m/common/ckpt/gaochang/OPD/Qwen3-4B-Instruct-2507
+  - role: teacher
+    name: teacher_1
+    overrides:
+      load: /mnt/amedelastic-m/common/ckpt/gaochang/OPD/Qwen3-4B-Thinking-2507
