@@ -1108,6 +1108,41 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-top-k",
+                type=int,
+                default=0,
+                help=(
+                    "Number of top-K tokens for OPD reward computation. "
+                    "0 means sampled-token OPD (current behavior). "
+                    "Positive values enable top-K OPD with denser learning signal."
+                ),
+            )
+            parser.add_argument(
+                "--opd-top-k-strategy",
+                type=str,
+                choices=["only_stu", "only_tch", "intersection", "union"],
+                default="only_stu",
+                help=(
+                    "Strategy for selecting the top-K token set. "
+                    "'only_stu': use student's top-K, query teacher log-probs on them. "
+                    "'only_tch': use teacher's top-K, query student log-probs on them. "
+                    "'intersection': keep tokens in both student and teacher top-K. "
+                    "'union': merge student and teacher top-K (deduplicated)."
+                ),
+            )
+            parser.add_argument(
+                "--opd-reward-weight-mode",
+                type=str,
+                choices=["student_p", "teacher_p", "none"],
+                default="student_p",
+                help=(
+                    "Weighting scheme for top-K token rewards. "
+                    "'student_p': weight by student probability (softmax normalized). "
+                    "'teacher_p': weight by teacher probability (softmax normalized). "
+                    "'none': uniform weight across top-K tokens."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):

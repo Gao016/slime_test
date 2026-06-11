@@ -14,7 +14,6 @@ import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
 
-from slime.backends.sglang_utils.server_control import abort_servers_until_idle
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.utils.async_utils import run
@@ -38,6 +37,21 @@ __all__ = ["generate_rollout", "get_model_url"]
 logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+
+# Max chars to log for a sample's reward. For custom RMs (e.g. OPD) the reward can
+# be the full teacher response dict with per-token top-K log-prob matrices that
+# reach hundreds of MB; logging it verbatim overflows the ray job-submit log
+# WebSocket and freezes the foreground tail. Small rewards (scalars/short dicts)
+# are still logged in full.
+_REWARD_LOG_MAX_CHARS = 1000
+
+
+def _format_reward_for_log(reward) -> str:
+    """Stringify a sample reward for logging, truncating oversized payloads."""
+    text = str(reward)
+    if len(text) > _REWARD_LOG_MAX_CHARS:
+        return f"{text[:_REWARD_LOG_MAX_CHARS]}... [truncated, {len(text)} chars total]"
+    return text
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -175,6 +189,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "return_logprob": True,
     }
 
+    opd_top_k = getattr(args, "opd_top_k", 0)
+    if opd_top_k > 0:
+        payload["top_logprobs_num"] = opd_top_k
+
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
 
@@ -201,8 +219,33 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
 
     if "output_token_logprobs" in output["meta_info"]:
-        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        output_token_logprobs = output["meta_info"]["output_token_logprobs"]
+        new_response_tokens = [item[1] for item in output_token_logprobs]
+        new_response_log_probs = [item[0] for item in output_token_logprobs]
+
+        # Extract student top-K token IDs and log-probs when OPD top-K is enabled
+        if opd_top_k > 0 and len(output_token_logprobs) > 0:
+            stu_top_k_ids = []
+            stu_top_k_lps = []
+            for item in output_token_logprobs:
+                if len(item) > 2 and item[2] is not None:
+                    # item[2] = [[lp, id], ...]. SGLang may return id=None or lp=None for
+                    # padded/invalid top-K slots; coerce to padding (id=0, lp=-inf) so the
+                    # K dimension stays rectangular and these slots get masked downstream.
+                    ids = [pair[1] if pair[1] is not None else 0 for pair in item[2]]
+                    lps = [pair[0] if pair[0] is not None else float("-inf") for pair in item[2]]
+                    stu_top_k_ids.append(ids)
+                    stu_top_k_lps.append(lps)
+                else:
+                    # Fallback: use the sampled token itself as the only "top-1"
+                    stu_top_k_ids.append([item[1]] + [0] * (opd_top_k - 1))
+                    stu_top_k_lps.append([item[0]] + [float("-inf")] * (opd_top_k - 1))
+            if sample.student_top_k_ids is None:
+                sample.student_top_k_ids = stu_top_k_ids
+                sample.student_top_k_log_probs = stu_top_k_lps
+            else:
+                sample.student_top_k_ids += stu_top_k_ids
+                sample.student_top_k_log_probs += stu_top_k_lps
     else:
         new_response_tokens, new_response_log_probs = [], []
 
@@ -362,7 +405,12 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
         urls = [worker["url"] for worker in response["workers"]]
 
-    await abort_servers_until_idle(urls)
+    logger.info(f"Abort request for {urls}")
+    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+    for url, result in zip(urls, abort_results, strict=False):
+        if isinstance(result, Exception):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
 
     # make sure all the pending tasks are finished
     count = 0
@@ -434,7 +482,7 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {_format_reward_for_log(sample.reward)}",
                 )
                 do_print = False
 
@@ -455,7 +503,7 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {_format_reward_for_log(sample.reward)}",
     )
 
     # there are still some unfinished requests, abort them
@@ -578,7 +626,7 @@ async def eval_rollout_single_dataset(
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(logged_sample.prompt) + logged_sample.response]} "
-                f"reward={logged_sample.reward}"
+                f"reward={_format_reward_for_log(logged_sample.reward)}"
             )
             do_print = False
         if isinstance(sample, list):

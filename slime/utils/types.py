@@ -35,6 +35,11 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    teacher_top_k_ids: list | None = None  # Teacher top-K token IDs [response_length, K]
+    teacher_top_k_log_probs: list | None = None  # Teacher top-K log-probs [response_length, K]
+    student_top_k_ids: list | None = None  # Student top-K token IDs [response_length, K]
+    student_top_k_log_probs: list | None = None  # Student top-K log-probs [response_length, K]
+    teacher_on_student_log_probs: list | None = None  # Teacher log-probs on student top-K tokens [response_length, K]
 
     class Status(Enum):
         PENDING = "pending"

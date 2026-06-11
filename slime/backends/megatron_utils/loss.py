@@ -530,6 +530,44 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def _compute_topk_weighted_kl(
+    student_top_k_log_probs: torch.Tensor,
+    teacher_top_k_log_probs: torch.Tensor,
+    weight_mode: str,
+) -> torch.Tensor:
+    """Compute weighted reverse KL over top-K tokens at each position.
+
+    Args:
+        student_top_k_log_probs: [response_length, K] student log-probs on top-K tokens.
+        teacher_top_k_log_probs: [response_length, K] teacher log-probs on the same tokens.
+        weight_mode: "student_p", "teacher_p", or "none".
+
+    Returns:
+        [response_length] per-position weighted reverse KL scalar.
+    """
+    kl_per_token = student_top_k_log_probs - teacher_top_k_log_probs  # [resp_len, K]
+
+    # Mask out padded positions where both student and teacher log-probs are -inf.
+    # (-inf) - (-inf) = NaN, which propagates through softmax * kl → NaN gradient.
+    valid_mask = torch.isfinite(student_top_k_log_probs) & torch.isfinite(teacher_top_k_log_probs)
+    kl_per_token = torch.where(valid_mask, kl_per_token, 0.0)
+
+    if weight_mode == "student_p":
+        log_weights = student_top_k_log_probs
+    elif weight_mode == "teacher_p":
+        log_weights = teacher_top_k_log_probs
+    else:
+        log_weights = torch.zeros_like(student_top_k_log_probs)
+
+    # Replace -inf with a large negative number for softmax stability,
+    # then zero out the weights for invalid positions.
+    log_weights = torch.where(valid_mask, log_weights, torch.finfo(log_weights.dtype).min)
+    weights = torch.softmax(log_weights, dim=-1)  # [resp_len, K]
+    weights = torch.where(valid_mask, weights, 0.0)
+    reverse_kl = (kl_per_token * weights).sum(dim=-1)  # [resp_len]
+    return reverse_kl
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
@@ -541,33 +579,93 @@ def apply_opd_kl_to_advantages(
     Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
     to advantages in-place. This is orthogonal to the base advantage estimator.
 
+    When opd_top_k > 0, uses top-K weighted KL for denser learning signal.
+    When opd_top_k == 0, uses sampled-token KL (original behavior).
+
     Args:
-        args: Configuration containing `use_opd` and `opd_kl_coef`.
-        rollout_data: Dict containing "teacher_log_probs".
+        args: Configuration containing `use_opd`, `opd_kl_coef`, `opd_top_k`,
+            `opd_top_k_strategy`, and `opd_reward_weight_mode`.
+        rollout_data: Dict containing "teacher_log_probs" and, for top-K OPD,
+            "student_top_k_log_probs" and "teacher_on_student_log_probs"
+            (teacher log-probs on the student's top-K tokens, token-aligned).
         advantages: List of advantage tensors to modify in-place.
         student_log_probs: List of student log-probability tensors.
 
     References:
-        https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py
+        https://arxiv.org/abs/2604.13016
     """
 
     if student_log_probs is None:
         return
 
-    teacher_log_probs = rollout_data.get("teacher_log_probs")
-    if teacher_log_probs is None:
-        raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+    top_k = getattr(args, "opd_top_k", 0)
 
+    if top_k == 0:
+        # === Sampled-token OPD (original behavior) ===
+        teacher_log_probs = rollout_data.get("teacher_log_probs")
+        if teacher_log_probs is None:
+            raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+
+        device = student_log_probs[0].device
+        teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+
+        reverse_kls = []
+        for i, adv in enumerate(advantages):
+            reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            reverse_kls.append(reverse_kl)
+
+        rollout_data["opd_reverse_kl"] = reverse_kls
+        return
+
+    # === Top-K OPD ===
+    strategy = getattr(args, "opd_top_k_strategy", "only_stu")
+    weight_mode = getattr(args, "opd_reward_weight_mode", "student_p")
     device = student_log_probs[0].device
-    teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+
+    student_top_k_lps = rollout_data.get("student_top_k_log_probs")
+    teacher_on_student_lps = rollout_data.get("teacher_on_student_log_probs")
+
+    if student_top_k_lps is None or teacher_on_student_lps is None:
+        raise ValueError(
+            "Top-K OPD requires 'student_top_k_log_probs' and 'teacher_on_student_log_probs' in rollout_data. "
+            "Ensure student rollout returns top-K data and teacher reward_func returns token_ids_logprob "
+            "(see slime/rollout/on_policy_distillation.py)."
+        )
 
     reverse_kls = []
-    for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
-        reverse_kls.append(reverse_kl)
 
-    # Store reverse KL for logging
+    if strategy == "only_stu":
+        # only_stu (OPD paper): KL is computed on the student's own top-K token set.
+        #   kl = S_logp - T_on_S
+        # where S_logp = student's log-prob on its top-K tokens (from rollout), and
+        # T_on_S = teacher's log-prob on those *same* student top-K tokens (token-aligned).
+        # T_on_S is obtained in reward_func via SGLang token_ids_logprob (union of student
+        # top-K ids) and gathered per-position in post_process_rewards. This is the correct
+        # token-aligned KL (NOT the previous rank-wise subtraction of two independent top-Ks).
+        for i, adv in enumerate(advantages):
+            s_lps = (
+                student_top_k_lps[i].to(device)
+                if isinstance(student_top_k_lps[i], torch.Tensor)
+                else torch.tensor(student_top_k_lps[i], dtype=torch.float32, device=device)
+            )
+            t_on_s = (
+                teacher_on_student_lps[i].to(device)
+                if isinstance(teacher_on_student_lps[i], torch.Tensor)
+                else torch.tensor(teacher_on_student_lps[i], dtype=torch.float32, device=device)
+            )
+
+            reverse_kl = _compute_topk_weighted_kl(s_lps, t_on_s, weight_mode)
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            reverse_kls.append(reverse_kl)
+
+    else:
+        raise NotImplementedError(
+            f"Top-K OPD strategy '{strategy}' is not yet implemented. "
+            f"Currently only 'only_stu' is supported. "
+            f"'only_tch', 'intersection', 'union' require additional training-side forward passes."
+        )
+
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
