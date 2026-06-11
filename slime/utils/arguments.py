@@ -1108,6 +1108,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-full-vocab-kl",
+                action="store_true",
+                default=False,
+                help="Enable full-vocabulary KL as auxiliary loss during training. "
+                "Requires --use-opd --opd-type megatron, CP=1, no VPP, no muP.",
+            )
+            parser.add_argument(
+                "--opd-full-vocab-kl-alpha",
+                type=float,
+                default=1.0,
+                help="KL direction: 0=forward KL(teacher||student), 1=reverse, 0.5=JSD.",
+            )
+            parser.add_argument(
+                "--opd-full-vocab-kl-coef",
+                type=float,
+                default=None,
+                help="Coefficient for full-vocab KL loss. Defaults to --opd-kl-coef if unset.",
+            )
+            parser.add_argument(
+                "--opd-full-vocab-kl-tile-size",
+                type=int,
+                default=128,
+                help="Number of tokens per tile during tiled KL computation.",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1648,6 +1673,46 @@ def parse_critic_args(actor_args, megatron_config_path):
     return parse_megatron_role_args(actor_args, megatron_config_path, role="critic")
 
 
+def parse_opd_teachers_from_config(config_path: str) -> list[dict]:
+    """Parse role=teacher entries from megatron config YAML for multi-teacher OPD.
+
+    Returns list of dicts: [{"name": "teacher_0", "load": path, "ckpt_step": N|None}, ...]
+    """
+    with open(config_path) as f:
+        raw_config = yaml.safe_load(f) or {}
+
+    megatron_entries = raw_config.get("megatron", [])
+    if not isinstance(megatron_entries, list):
+        return []
+
+    teachers = []
+    for entry in megatron_entries:
+        if entry.get("role") != "teacher":
+            continue
+        overrides = entry.get("overrides", {})
+        if "load" not in overrides:
+            raise ValueError(
+                f"Teacher entry '{entry.get('name', '?')}' in megatron config " f"must specify 'load' in overrides."
+            )
+        teachers.append(
+            {
+                "name": entry.get("name", f"teacher_{len(teachers)}"),
+                "load": overrides["load"],
+                "ckpt_step": overrides.get("ckpt_step"),
+            }
+        )
+
+    # Single teacher without explicit name must use "teacher" to match backup_tags check in actor.py
+    if (
+        len(teachers) == 1
+        and "name"
+        not in megatron_entries[next(i for i, e in enumerate(megatron_entries) if e.get("role") == "teacher")]
+    ):
+        teachers[0]["name"] = "teacher"
+
+    return teachers
+
+
 def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     """
     Build evaluation dataset configurations from either --eval-config or --eval-prompt-data.
@@ -1768,20 +1833,25 @@ def slime_validate_args(args):
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
 
         if args.opd_type == "megatron":
-            if args.opd_teacher_load is None:
+            has_yaml_teachers = False
+            if args.megatron_config_path:
+                has_yaml_teachers = bool(parse_opd_teachers_from_config(args.megatron_config_path))
+            if args.opd_teacher_load is None and not has_yaml_teachers:
                 raise ValueError(
-                    "--opd-teacher-load is required when --opd-type=megatron. "
+                    "--opd-teacher-load is required when --opd-type=megatron "
+                    "(unless teachers are defined in --megatron-config-path). "
                     "Please provide the path to the teacher model checkpoint."
                 )
-            if not os.path.exists(args.opd_teacher_load):
-                raise FileNotFoundError(
-                    f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
-                )
-            if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
-                logger.info(
-                    f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
-                    "please make sure it is a valid megatron checkpoint directory."
-                )
+            if args.opd_teacher_load is not None:
+                if not os.path.exists(args.opd_teacher_load):
+                    raise FileNotFoundError(
+                        f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
+                    )
+                if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
+                    logger.info(
+                        f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
+                        "please make sure it is a valid megatron checkpoint directory."
+                    )
 
         elif args.opd_type == "sglang":
             if args.opd_teacher_load is not None:
@@ -1789,6 +1859,27 @@ def slime_validate_args(args):
                     "--opd-teacher-load should not be set when --opd-type=sglang. "
                     "In sglang mode, teacher log-probs are obtained from external server during rollout."
                 )
+
+        if getattr(args, "opd_full_vocab_kl", False):
+            assert args.opd_type == "megatron", "--opd-full-vocab-kl requires --opd-type megatron"
+            assert args.context_parallel_size == 1, "--opd-full-vocab-kl currently requires CP=1."
+            vpp_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
+            assert vpp_size is None or vpp_size <= 1, "--opd-full-vocab-kl does not support VPP."
+            assert not getattr(args, "use_mup", False), "--opd-full-vocab-kl does not support muP output scaling."
+            assert (
+                args.qkv_format == "thd"
+            ), "--opd-full-vocab-kl currently requires --qkv-format thd (packed sequence)."
+
+        # Normalize multi-teacher config: build args.opd_teachers from megatron_config or single CLI arg
+        opd_teachers = []
+        if args.megatron_config_path and args.opd_type == "megatron":
+            opd_teachers = parse_opd_teachers_from_config(args.megatron_config_path)
+        if not opd_teachers and args.opd_teacher_load:
+            opd_teachers = [
+                {"name": "teacher", "load": args.opd_teacher_load, "ckpt_step": args.opd_teacher_ckpt_step}
+            ]
+        args.opd_teachers = opd_teachers
+        args.num_opd_teachers = len(opd_teachers)
     else:
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:

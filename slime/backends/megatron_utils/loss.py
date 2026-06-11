@@ -383,6 +383,77 @@ def _extract_per_sample(
     return log_probs_list, entropy_list
 
 
+def _extract_response_hidden_states_cp1(
+    hidden: torch.Tensor,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None = None,
+) -> list[torch.Tensor]:
+    """Extract per-sample response-aligned hidden states (CP=1 only).
+
+    Position t-1 predicts token t, so response hidden states are at
+    [prompt_len - 1 : total_len - 1) — mirroring _extract_per_sample's CP=1 path.
+    """
+    result = []
+    if qkv_format == "thd":
+        offset = 0
+        for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
+            end = offset + total_length
+            start = end - response_length
+            result.append(hidden[start - 1 : end - 1].contiguous())
+            offset += total_length
+    else:  # bshd
+        for i, (total_length, response_length) in enumerate(zip(total_lengths, response_lengths, strict=False)):
+            end = max_seq_lens[i] * i + total_length
+            start = end - response_length
+            result.append(hidden[start - 1 : end - 1].contiguous())
+    return result
+
+
+def get_log_probs_and_response_hidden_states(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    hidden_capture,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    with_entropy: bool = False,
+    non_loss_data: bool = True,
+    max_seq_lens: list[int] | None = None,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    """Callback that returns log_probs AND response-aligned hidden states.
+
+    Delegates log_probs computation to get_log_probs_and_entropy, then pops
+    the hidden states captured by the output_layer pre_hook for this microbatch
+    and slices them to response-aligned positions.
+    """
+    _, res = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=unconcat_tokens,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        with_entropy=with_entropy,
+        non_loss_data=non_loss_data,
+        max_seq_lens=max_seq_lens,
+    )
+
+    # pre_hook captures Megatron internal format [S, B, D] (sequence-first)
+    hidden = hidden_capture.pop()
+    if args.qkv_format == "thd":
+        hidden = hidden.squeeze(1)
+    else:
+        hidden = hidden.permute(1, 0, 2).contiguous().view(-1, hidden.size(-1))
+
+    res["response_hidden_states"] = _extract_response_hidden_states_cp1(
+        hidden, total_lengths, response_lengths, args.qkv_format, max_seq_lens
+    )
+
+    return torch.empty((0,), device=logits.device), res
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -679,7 +750,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
-    if args.use_opd:
+    # When opd_full_vocab_kl is enabled, KL is applied as auxiliary loss in policy_loss_function instead.
+    if args.use_opd and not getattr(args, "opd_full_vocab_kl", False):
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
@@ -985,6 +1057,47 @@ def policy_loss_function(
 
         loss = loss + args.kl_loss_coef * kl_loss
 
+    # Full-vocabulary KL as auxiliary loss (OPD)
+    opd_full_vocab_kl_loss = None
+    if getattr(args, "opd_full_vocab_kl", False) and batch.get("teacher_response_hidden_states"):
+        from slime_plugins.opd_full_vocab.loss import compute_full_vocab_kl_loss
+        from slime_plugins.opd_full_vocab.registry import TeacherHeadRegistry
+
+        opd_kl_coef = args.opd_full_vocab_kl_coef if args.opd_full_vocab_kl_coef is not None else args.opd_kl_coef
+        teacher_ids_mb = batch.get("teacher_ids")
+
+        if teacher_ids_mb is None or getattr(args, "num_opd_teachers", 1) <= 1:
+            teacher_weight = TeacherHeadRegistry.get("teacher")
+            if teacher_weight is not None:
+                opd_full_vocab_kl_loss = compute_full_vocab_kl_loss(
+                    student_logits=logits,
+                    teacher_hs=batch["teacher_response_hidden_states"],
+                    teacher_weight=teacher_weight,
+                    total_lengths=total_lengths,
+                    response_lengths=response_lengths,
+                    loss_masks=batch["loss_masks"],
+                    tile_size=args.opd_full_vocab_kl_tile_size,
+                    alpha=args.opd_full_vocab_kl_alpha,
+                )
+        else:
+            from slime_plugins.opd_full_vocab.loss import compute_multi_teacher_kl_loss
+
+            opd_full_vocab_kl_loss = compute_multi_teacher_kl_loss(
+                student_logits=logits,
+                teacher_hs=batch["teacher_response_hidden_states"],
+                teacher_ids=teacher_ids_mb,
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                loss_masks=batch["loss_masks"],
+                tile_size=args.opd_full_vocab_kl_tile_size,
+                alpha=args.opd_full_vocab_kl_alpha,
+            )
+
+        if opd_full_vocab_kl_loss is not None:
+            # TODO: add back this
+            loss = loss + opd_kl_coef * opd_full_vocab_kl_loss
+            # loss = opd_kl_coef * opd_full_vocab_kl_loss
+
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
@@ -1007,6 +1120,9 @@ def policy_loss_function(
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if opd_full_vocab_kl_loss is not None:
+        reported_loss["opd_full_vocab_kl_loss"] = opd_full_vocab_kl_loss.clone().detach()
 
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.

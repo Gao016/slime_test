@@ -120,9 +120,17 @@ class MegatronTrainRayActor(TrainRayActor):
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
 
-        # Load teacher model for Megatron-based on-policy distillation
+        # Load teacher model(s) for Megatron-based on-policy distillation
         if with_opd_teacher:
-            self.load_other_checkpoint("teacher", args.opd_teacher_load)
+            for teacher_cfg in args.opd_teachers:
+                tag = teacher_cfg["name"]
+                path = teacher_cfg["load"]
+                self.load_other_checkpoint(tag, path)
+                if getattr(args, "opd_full_vocab_kl", False) and mpu.is_pipeline_last_stage():
+                    from slime_plugins.opd_full_vocab.capture import get_lm_head_weight
+                    from slime_plugins.opd_full_vocab.registry import TeacherHeadRegistry
+
+                    TeacherHeadRegistry.set(tag, get_lm_head_weight(self.model))
 
         if self.args.keep_old_actor:
             # Load old_actor checkpoint
@@ -390,15 +398,39 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
+        need_hidden = (
+            getattr(self.args, "opd_full_vocab_kl", False)
+            and store_prefix.startswith("teacher")
+            and mpu.is_pipeline_last_stage()
+        )
+
+        if need_hidden:
+            from functools import partial
+
+            from slime_plugins.opd_full_vocab.capture import HiddenCapture, register_capture_hook
+
+            from .loss import get_log_probs_and_response_hidden_states
+
+            hidden_capture = HiddenCapture()
+            hook_handle = register_capture_hook(self.model, self.args, hidden_capture)
+            callback = partial(get_log_probs_and_response_hidden_states, hidden_capture=hidden_capture)
+        else:
+            hook_handle = None
+            callback = get_log_probs_and_entropy
+
         with timer(f"{store_prefix}log_probs"):
-            return forward_only(
-                get_log_probs_and_entropy,
-                self.args,
-                self.model,
-                data_iterator,
-                num_microbatches,
-                store_prefix=store_prefix,
-            )
+            try:
+                return forward_only(
+                    callback,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    store_prefix=store_prefix,
+                )
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
 
     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
         if self.args.debug_rollout_only:
@@ -473,7 +505,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
 
-                # Forward teacher model to get teacher_log_probs for Megatron-based OPD
+                # Forward teacher model(s) to get teacher_log_probs for Megatron-based OPD
                 if "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -485,6 +517,50 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="teacher_",
                         )
                     )
+                    if getattr(self.args, "opd_full_vocab_kl", False) and mpu.is_pipeline_last_stage():
+                        if getattr(self.args, "ci_test", False):
+                            from slime_plugins.opd_full_vocab.ci_utils import (
+                                assert_reconstructed_token_log_probs_close,
+                            )
+                            from slime_plugins.opd_full_vocab.registry import TeacherHeadRegistry
+
+                            assert_reconstructed_token_log_probs_close(
+                                name="teacher",
+                                hidden_states=rollout_data["teacher_response_hidden_states"],
+                                lm_head_weight=TeacherHeadRegistry.get("teacher"),
+                                reference_log_probs=rollout_data["teacher_log_probs"],
+                                tokens=rollout_data["tokens"],
+                                response_lengths=rollout_data["response_lengths"],
+                                rollout_temperature=getattr(self.args, "rollout_temperature", 1.0),
+                            )
+                elif self.args.num_opd_teachers > 1:
+                    if self.args.use_routing_replay:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    if "teacher_ids" not in rollout_data:
+                        # Fallback: no per-sample teacher assignment (rollout didn't produce
+                        # teacher_ids). Assign each sample to one teacher round-robin so
+                        # every teacher contributes to the KL signal.
+                        n_samples = len(rollout_data["tokens"])
+                        rollout_data["teacher_ids"] = [i % self.args.num_opd_teachers for i in range(n_samples)]
+                    teacher_ids = rollout_data["teacher_ids"]
+                    n_samples = len(teacher_ids)
+                    unique_tids = sorted(set(teacher_ids))
+                    all_teacher_hs = [None] * n_samples
+                    all_teacher_log_probs = [None] * n_samples
+
+                    for tid in unique_tids:
+                        self._switch_model(f"teacher_{tid}")
+                        result = self.compute_log_prob(data_iterator, num_microbatches, store_prefix="teacher_")
+                        if mpu.is_pipeline_last_stage():
+                            for i, t in enumerate(teacher_ids):
+                                if t == tid:
+                                    if "teacher_response_hidden_states" in result:
+                                        all_teacher_hs[i] = result["teacher_response_hidden_states"][i]
+                                    all_teacher_log_probs[i] = result["teacher_log_probs"][i]
+                        del result
+
+                    rollout_data["teacher_response_hidden_states"] = all_teacher_hs
+                    rollout_data["teacher_log_probs"] = all_teacher_log_probs
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 can_reuse_log_probs_in_loss = (
@@ -664,6 +740,7 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
+        # TODO(Phase2): extend signature to accept ckpt_step param for per-teacher step override
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = path
         self.args.no_load_optim = True

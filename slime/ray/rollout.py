@@ -29,35 +29,12 @@ from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
 from .rollout_validation import validate_server_group_gpu_indices
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, add_default_ray_env_vars
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-_SGLANG_REQUEST_PERF_FIELDS = (
-    ("request/e2e_latency", "e2e_latency"),
-    ("request/queue_time", "queue_time"),
-    ("decode/throughput", "decode_throughput"),
-)
-_SGLANG_PREFILL_PERF_FIELDS = (
-    ("prefill/bootstrap_queue_duration", "pd_prefill_bootstrap_queue_duration"),
-    ("prefill/bootstrap_duration", "pd_prefill_bootstrap_duration"),
-    ("prefill/alloc_wait_duration", "pd_prefill_alloc_wait_duration"),
-    ("prefill/forward_duration", "pd_prefill_forward_duration"),
-    ("prefill/transfer_queue_duration", "pd_prefill_transfer_queue_duration"),
-    ("prefill/transfer_speed_gb_s", "pd_transfer_speed_gb_s"),
-    ("prefill/transfer_total_mb", "pd_transfer_total_mb"),
-    ("prefill/retry_count", "pd_prefill_retry_count"),
-)
-_SGLANG_DECODE_PERF_FIELDS = (
-    ("decode/prealloc_duration", "pd_decode_prealloc_duration"),
-    ("decode/bootstrap_duration", "pd_decode_bootstrap_duration"),
-    ("decode/alloc_wait_duration", "pd_decode_alloc_wait_duration"),
-    ("decode/transfer_duration", "pd_decode_transfer_duration"),
-    ("decode/forward_duration", "pd_decode_forward_duration"),
-)
 
 
 @dataclasses.dataclass
@@ -163,7 +140,7 @@ class ServerGroup:
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
-                    "env_vars": add_default_ray_env_vars(env_vars),
+                    "env_vars": env_vars,
                 },
             ).remote(
                 self.args,
@@ -409,11 +386,7 @@ class RolloutManager:
             self.servers = start_rollout_servers(args, pg)
 
         init_tracking(args, primary=False)
-        self.rollout_engine_lock = Lock.options(
-            num_cpus=1,
-            num_gpus=0,
-            runtime_env={"env_vars": add_default_ray_env_vars()},
-        ).remote()
+        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
 
         self._health_monitors = []
@@ -693,15 +666,15 @@ class RolloutManager:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
-        rollout_ids = [sample.rollout_id for sample in samples]
-        existed_rollout_id_values = set(rid for rid in rollout_ids if rid is not None)
-        tmp_id = 0
-        for i in range(len(rollout_ids)):
-            if rollout_ids[i] is None:
-                while tmp_id in existed_rollout_id_values:
-                    tmp_id += 1
-                rollout_ids[i] = tmp_id
-                existed_rollout_id_values.add(tmp_id)
+        # Rollout id (one per rollout execution). Default rollouts emit one
+        # sample per rollout, so we fall back to ``sample.index`` (unique).
+        # Compact / subagent paths that emit multiple training samples per
+        # rollout set ``rollout_id`` explicitly so all siblings share a
+        # value; the loss reducer then aggregates them as one rollout.
+        if samples[0].rollout_id is None:
+            rollout_ids = list(range(len(samples)))
+        else:
+            rollout_ids = [sample.rollout_id for sample in samples]
 
         train_data = {
             "tokens": [sample.tokens for sample in samples],
@@ -776,6 +749,11 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if any(s.metadata and "teacher_id" in s.metadata for s in samples):
+            train_data["teacher_ids"] = [
+                s.metadata["teacher_id"] if s.metadata and "teacher_id" in s.metadata else 0 for s in samples
+            ]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -825,6 +803,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_ids",
             ]:
                 if key not in data:
                     continue
@@ -1290,61 +1269,8 @@ def compute_perf_metrics_from_samples(args, samples, rollout_time):
 
     token_perf([sample.response_length for sample in samples], non_generation_time, key="")
     token_perf([sample.effective_response_length for sample in samples], non_generation_time, key="effective_")
-    log_dict |= _compute_sglang_request_perf_metrics(samples)
 
     return log_dict
-
-
-def _compute_sglang_request_perf_metrics(all_samples: list[Sample]):
-    attrs_by_request = list(_iter_sglang_generate_attrs(all_samples))
-    if not attrs_by_request:
-        return {}
-
-    values_by_metric: dict[str, list[float]] = {}
-    profiled_request_count = 0
-
-    def add_value(metric_key: str, source_key: str, attrs: dict) -> bool:
-        value = attrs.get(source_key)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not np.isfinite(value):
-            return False
-        values_by_metric.setdefault(metric_key, []).append(float(value))
-        return True
-
-    for attrs in attrs_by_request:
-        request_has_perf = False
-
-        for metric_key, source_key in _SGLANG_REQUEST_PERF_FIELDS:
-            request_has_perf |= add_value(metric_key, source_key, attrs)
-
-        for metric_key, source_key in _SGLANG_PREFILL_PERF_FIELDS:
-            request_has_perf |= add_value(metric_key, source_key, attrs)
-
-        for metric_key, source_key in _SGLANG_DECODE_PERF_FIELDS:
-            request_has_perf |= add_value(metric_key, source_key, attrs)
-
-        if request_has_perf:
-            profiled_request_count += 1
-
-    metrics: dict[str, float] = {}
-    for key, values in values_by_metric.items():
-        if not values:
-            continue
-        metrics |= dict_add_prefix(compute_statistics(values), f"{key}/")
-
-    return metrics
-
-
-def _iter_sglang_generate_attrs(all_samples: list[Sample]):
-    for sample in all_samples:
-        trace = getattr(sample, "trace", None)
-        if not isinstance(trace, dict):
-            continue
-        for event in trace.get("events") or []:
-            if event.get("type") != "span_end" or event.get("name") != "sglang_generate":
-                continue
-            attrs = event.get("attrs")
-            if isinstance(attrs, dict):
-                yield attrs
 
 
 def _compute_zero_std_metrics(args, all_samples: list[Sample]):

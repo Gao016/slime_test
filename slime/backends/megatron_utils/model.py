@@ -502,6 +502,8 @@ def train_one_step(
                 "max_seq_lens",
                 "teacher_log_probs",
                 "rollout_mask_sums",
+                "teacher_response_hidden_states",
+                "teacher_ids",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -814,6 +816,11 @@ def train(
                     and "train/kl_loss" in log_dict
                 ):
                     assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
+                if accumulated_step_id == 0 and "train/opd_full_vocab_kl_loss" in log_dict:
+                    assert log_dict["train/opd_full_vocab_kl_loss"] < 1e-4, (
+                        f"Full-vocab KL loss should be ≈0 on first step (same-model teacher), "
+                        f"got {log_dict['train/opd_full_vocab_kl_loss']}"
+                    )
 
             logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
 
