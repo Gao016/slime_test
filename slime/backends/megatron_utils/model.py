@@ -34,7 +34,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
 from .loss import loss_function
-from .model_provider import get_model_provider_func
+from .model_provider import build_teacher_provider, get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,62 @@ def setup_model_and_optimizer(
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
+
+
+def build_teacher_model(args: Namespace, teacher_hf_checkpoint: str, load_path: str) -> list[GPTModel]:
+    """Build and load a forward-only OPD teacher as an independent model instance.
+
+    The teacher is built from its own HF config (``teacher_hf_checkpoint``) so it can have
+    a different architecture than the student, and its weights are loaded from ``load_path``
+    (HF safetensors or a Megatron checkpoint dir). No optimizer/scheduler/grad buffers are
+    created -- the teacher only ever runs forward under ``torch.no_grad``.
+
+    Returns a list of model chunks (matching ``self.model``'s shape; len 1 for PP=1).
+    """
+    # Build the teacher graph from its own architecture. wrap_with_ddp=False avoids
+    # allocating grad buffers we never use (the teacher is forward-only).
+    # wrap_model_provider_with_freeze filters provider kwargs (config/pg_collection/vp_stage)
+    # by signature, matching how get_model_provider_func adapts bridge providers to get_model.
+    teacher_provider = wrap_model_provider_with_freeze(build_teacher_provider(args, teacher_hf_checkpoint), args)
+    model = get_model(
+        teacher_provider,
+        ModelType.encoder_or_decoder,
+        wrap_with_ddp=False,
+    )
+
+    # Load teacher weights. load_checkpoint() reads args.load and (for HF) builds the
+    # bridge from that path, so temporarily point args.load at the teacher.
+    old_load, old_no_load_optim, old_no_load_rng, old_finetune = (
+        args.load,
+        args.no_load_optim,
+        args.no_load_rng,
+        args.finetune,
+    )
+    args.load = load_path
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    try:
+        load_checkpoint(
+            model,
+            None,
+            None,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
+    finally:
+        args.load, args.no_load_optim, args.no_load_rng, args.finetune = (
+            old_load,
+            old_no_load_optim,
+            old_no_load_rng,
+            old_finetune,
+        )
+
+    for chunk in model:
+        chunk.eval()
+        for p in chunk.parameters():
+            p.requires_grad_(False)
+    return model
 
 
 def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
@@ -816,7 +872,14 @@ def train(
                     and "train/kl_loss" in log_dict
                 ):
                     assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
-                if accumulated_step_id == 0 and "train/opd_full_vocab_kl_loss" in log_dict:
+                # This ≈0 check only holds for a same-model teacher (teacher==student at step0).
+                # A heterogeneous teacher (different architecture) produces a finite KL at step0,
+                # so skip the assertion in that case.
+                if (
+                    accumulated_step_id == 0
+                    and "train/opd_full_vocab_kl_loss" in log_dict
+                    and not getattr(args, "opd_hetero_teacher", False)
+                ):
                     assert log_dict["train/opd_full_vocab_kl_loss"] < 1e-4, (
                         f"Full-vocab KL loss should be ≈0 on first step (same-model teacher), "
                         f"got {log_dict['train/opd_full_vocab_kl_loss']}"

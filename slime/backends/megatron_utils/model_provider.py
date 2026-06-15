@@ -266,6 +266,45 @@ def get_model_provider_func(args, role="actor"):
     return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
 
 
+def build_teacher_provider(args, teacher_hf_checkpoint: str):
+    """Build a model provider for a heterogeneous OPD teacher.
+
+    Unlike ``get_model_provider_func``, the architecture (num_layers / hidden_size /
+    num_experts / ...) is taken from ``teacher_hf_checkpoint``'s own HF config via the
+    Megatron bridge, NOT from the global ``args`` (which describe the student). This is
+    what allows a teacher with a different architecture (e.g. Qwen3-32B) to be built
+    alongside a smaller student (e.g. Qwen3-4B).
+
+    Only parallel-state knobs are inherited from ``args`` and must match the student's
+    process groups: TP must equal the student's TP, and PP is forced to 1 (prototype
+    constraint -- a teacher with a different layer count cannot share the student's PP
+    split). The teacher is forward-only, so no optimizer/critic head is built.
+    """
+    assert args.megatron_to_hf_mode == "bridge", (
+        "Heterogeneous OPD teacher requires --megatron-to-hf-mode bridge so the teacher "
+        "architecture is read from its own HF config; the default arg-driven provider "
+        "would build the teacher with the student's architecture."
+    )
+    from megatron.bridge import AutoBridge
+
+    import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
+
+    bridge = patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(teacher_hf_checkpoint, trust_remote_code=True))
+    provider = bridge.to_megatron_provider(load_weights=False)
+    # Parallel state must align with the student's process groups (shared mpu groups).
+    provider.tensor_model_parallel_size = args.tensor_model_parallel_size
+    provider.pipeline_model_parallel_size = 1  # prototype: teacher has its own layer count
+    provider.expert_model_parallel_size = args.expert_model_parallel_size
+    provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
+    provider.sequence_parallel = args.sequence_parallel
+    provider.context_parallel_size = args.context_parallel_size
+    provider.variable_seq_lengths = args.variable_seq_lengths
+    if hasattr(args, "moe_token_dispatcher_type"):
+        provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
+    provider.finalize()
+    return provider.provide
+
+
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):
     if getattr(args, "only_train_params_name_list", None):
         for name, param in model.named_parameters():

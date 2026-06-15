@@ -1133,6 +1133,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=128,
                 help="Number of tokens per tile during tiled KL computation.",
             )
+            parser.add_argument(
+                "--opd-hetero-teacher",
+                action="store_true",
+                default=False,
+                help="Build each OPD teacher as an independent resident model from its own HF "
+                "config, instead of swapping teacher weights into the student shell. Required "
+                "when teacher architecture differs from the student (e.g. Qwen3-32B -> Qwen3-4B). "
+                "Requires --opd-type megatron, --megatron-to-hf-mode bridge, and PP=1.",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1699,6 +1708,9 @@ def parse_opd_teachers_from_config(config_path: str) -> list[dict]:
                 "name": entry.get("name", f"teacher_{len(teachers)}"),
                 "load": overrides["load"],
                 "ckpt_step": overrides.get("ckpt_step"),
+                # For heterogeneous teachers, the architecture is built from this HF config.
+                # Defaults to the load path (HF dir doubles as both config and weights).
+                "hf_checkpoint": overrides.get("hf_checkpoint", overrides["load"]),
             }
         )
 
@@ -1870,13 +1882,28 @@ def slime_validate_args(args):
                 args.qkv_format == "thd"
             ), "--opd-full-vocab-kl currently requires --qkv-format thd (packed sequence)."
 
+        if getattr(args, "opd_hetero_teacher", False):
+            assert args.opd_type == "megatron", "--opd-hetero-teacher requires --opd-type megatron"
+            assert args.megatron_to_hf_mode == "bridge", (
+                "--opd-hetero-teacher requires --megatron-to-hf-mode bridge so each teacher's "
+                "architecture is read from its own HF config."
+            )
+            assert (
+                args.pipeline_model_parallel_size == 1
+            ), "--opd-hetero-teacher prototype requires PP=1 (teacher may have a different layer count)."
+
         # Normalize multi-teacher config: build args.opd_teachers from megatron_config or single CLI arg
         opd_teachers = []
         if args.megatron_config_path and args.opd_type == "megatron":
             opd_teachers = parse_opd_teachers_from_config(args.megatron_config_path)
         if not opd_teachers and args.opd_teacher_load:
             opd_teachers = [
-                {"name": "teacher", "load": args.opd_teacher_load, "ckpt_step": args.opd_teacher_ckpt_step}
+                {
+                    "name": "teacher",
+                    "load": args.opd_teacher_load,
+                    "ckpt_step": args.opd_teacher_ckpt_step,
+                    "hf_checkpoint": getattr(args, "opd_teacher_hf_checkpoint", None) or args.opd_teacher_load,
+                }
             ]
         args.opd_teachers = opd_teachers
         args.num_opd_teachers = len(opd_teachers)

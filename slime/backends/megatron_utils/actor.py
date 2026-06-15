@@ -33,7 +33,7 @@ from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_da
 from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import build_teacher_model, forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_disk import UpdateWeightFromDisk
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -120,17 +120,25 @@ class MegatronTrainRayActor(TrainRayActor):
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
 
-        # Load teacher model(s) for Megatron-based on-policy distillation
+        # Load teacher model(s) for Megatron-based on-policy distillation.
+        # self.teacher_models holds independent (possibly heterogeneous) teacher instances;
+        # it stays empty when teachers share the student shell (same-arch backuper path).
+        self.teacher_models: dict[str, list] = {}
         if with_opd_teacher:
-            for teacher_cfg in args.opd_teachers:
-                tag = teacher_cfg["name"]
-                path = teacher_cfg["load"]
-                self.load_other_checkpoint(tag, path)
-                if getattr(args, "opd_full_vocab_kl", False) and mpu.is_pipeline_last_stage():
-                    from slime_plugins.opd_full_vocab.capture import get_lm_head_weight
-                    from slime_plugins.opd_full_vocab.registry import TeacherHeadRegistry
+            if getattr(args, "opd_hetero_teacher", False):
+                self._init_teacher_models(args)
+            else:
+                # Same-architecture teacher: load into the student shell and snapshot via
+                # the CPU weights backuper (restored on demand by _switch_model).
+                for teacher_cfg in args.opd_teachers:
+                    tag = teacher_cfg["name"]
+                    path = teacher_cfg["load"]
+                    self.load_other_checkpoint(tag, path)
+                    if getattr(args, "opd_full_vocab_kl", False) and mpu.is_pipeline_last_stage():
+                        from slime_plugins.opd_full_vocab.capture import get_lm_head_weight
+                        from slime_plugins.opd_full_vocab.registry import TeacherHeadRegistry
 
-                    TeacherHeadRegistry.set(tag, get_lm_head_weight(self.model))
+                        TeacherHeadRegistry.set(tag, get_lm_head_weight(self.model))
 
         if self.args.keep_old_actor:
             # Load old_actor checkpoint
@@ -396,7 +404,11 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator: list[DataIterator],
         num_microbatches: list[int],
         store_prefix: str = "",
+        model: list | None = None,
     ) -> dict[str, list[torch.Tensor]]:
+        # ``model`` lets callers run the forward on an independent model instance (e.g. a
+        # heterogeneous OPD teacher); defaults to the student model ``self.model``.
+        model = model if model is not None else self.model
 
         need_hidden = (
             getattr(self.args, "opd_full_vocab_kl", False)
@@ -412,7 +424,7 @@ class MegatronTrainRayActor(TrainRayActor):
             from .loss import get_log_probs_and_response_hidden_states
 
             hidden_capture = HiddenCapture()
-            hook_handle = register_capture_hook(self.model, self.args, hidden_capture)
+            hook_handle = register_capture_hook(model, self.args, hidden_capture)
             callback = partial(get_log_probs_and_response_hidden_states, hidden_capture=hidden_capture)
         else:
             hook_handle = None
@@ -423,7 +435,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 return forward_only(
                     callback,
                     self.args,
-                    self.model,
+                    model,
                     data_iterator,
                     num_microbatches,
                     store_prefix=store_prefix,
@@ -505,8 +517,51 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
 
-                # Forward teacher model(s) to get teacher_log_probs for Megatron-based OPD
-                if "teacher" in self.weights_backuper.backup_tags:
+                # Forward teacher model(s) to get teacher_log_probs for Megatron-based OPD.
+                # Heterogeneous teachers live as independent resident models (self.teacher_models)
+                # and are forwarded directly; same-architecture teachers are swapped into the
+                # student shell via _switch_model.
+                if self.teacher_models:
+                    if self.args.use_routing_replay:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    if self.args.num_opd_teachers <= 1:
+                        tag = next(iter(self.teacher_models))
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="teacher_",
+                                model=self.teacher_models[tag],
+                            )
+                        )
+                    else:
+                        if "teacher_ids" not in rollout_data:
+                            n_samples = len(rollout_data["tokens"])
+                            rollout_data["teacher_ids"] = [i % self.args.num_opd_teachers for i in range(n_samples)]
+                        teacher_ids = rollout_data["teacher_ids"]
+                        n_samples = len(teacher_ids)
+                        unique_tids = sorted(set(teacher_ids))
+                        all_teacher_hs = [None] * n_samples
+                        all_teacher_log_probs = [None] * n_samples
+
+                        for tid in unique_tids:
+                            result = self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="teacher_",
+                                model=self.teacher_models[f"teacher_{tid}"],
+                            )
+                            if mpu.is_pipeline_last_stage():
+                                for i, t in enumerate(teacher_ids):
+                                    if t == tid:
+                                        if "teacher_response_hidden_states" in result:
+                                            all_teacher_hs[i] = result["teacher_response_hidden_states"][i]
+                                        all_teacher_log_probs[i] = result["teacher_log_probs"][i]
+                            del result
+
+                        rollout_data["teacher_response_hidden_states"] = all_teacher_hs
+                        rollout_data["teacher_log_probs"] = all_teacher_log_probs
+                elif "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("teacher")
@@ -769,3 +824,32 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
+
+    def _init_teacher_models(self, args: Namespace) -> None:
+        """Build independent (possibly heterogeneous) OPD teacher model instances.
+
+        Each teacher is built from its own HF config and kept resident on GPU as a
+        forward-only model, instead of being swapped into the student shell. This is what
+        enables architectures that differ from the student (e.g. Qwen3-32B teaching
+        Qwen3-4B). The student's weights are never touched here.
+        """
+        for teacher_cfg in args.opd_teachers:
+            tag = teacher_cfg["name"]
+            load_path = teacher_cfg["load"]
+            hf_checkpoint = teacher_cfg.get("hf_checkpoint", load_path)
+            # Barrier between teachers: each build_teacher_model runs a fresh bridge HF load
+            # that uses rank-0-driven streaming + internal dist.barrier(). Without forcing all
+            # ranks to the same point first, back-to-back loads can race (observed as an
+            # intermittent hang: rank-0 in disk-wait while other ranks spin in a collective).
+            if dist.is_initialized():
+                dist.barrier()
+            teacher_model = build_teacher_model(args, hf_checkpoint, load_path)
+            self.teacher_models[tag] = teacher_model
+            if getattr(args, "opd_full_vocab_kl", False) and mpu.is_pipeline_last_stage():
+                from slime_plugins.opd_full_vocab.capture import get_lm_head_weight
+                from slime_plugins.opd_full_vocab.registry import TeacherHeadRegistry
+
+                TeacherHeadRegistry.set(tag, get_lm_head_weight(teacher_model))
+        # Final barrier so all ranks finish teacher init together before training begins.
+        if dist.is_initialized():
+            dist.barrier()
