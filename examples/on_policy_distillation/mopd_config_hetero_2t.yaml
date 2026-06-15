@@ -1,0 +1,20 @@
+# Heterogeneous full-vocab MOPD: two teachers (Qwen3-32B + Qwen3-8B, both dense) ->
+# student Qwen3-4B (dense). All three share the same vocab (151936) so full-vocab KL is
+# well-defined; each teacher is built as an independent resident model from its own HF config.
+#
+# `load` points at torch_dist (Megatron-native) checkpoints so weights load via the
+# distributed-checkpoint path, NOT the HF bridge -- the latter deadlocks intermittently when
+# loading a second teacher (TP-rank scatter desync in megatron-bridge param conversion).
+# `hf_checkpoint` still points at the HF dir, used only to build the model architecture.
+# Names teacher_0 / teacher_1 match the keys used by compute_multi_teacher_kl_loss.
+megatron:
+  - role: teacher
+    name: teacher_0
+    overrides:
+      load: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-32B-tdst
+      hf_checkpoint: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-32B
+  - role: teacher
+    name: teacher_1
+    overrides:
+      load: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-8B-tdst
+      hf_checkpoint: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-8B
