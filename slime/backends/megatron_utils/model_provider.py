@@ -301,6 +301,14 @@ def build_teacher_provider(args, teacher_hf_checkpoint: str):
     provider.variable_seq_lengths = args.variable_seq_lengths
     if hasattr(args, "moe_token_dispatcher_type"):
         provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
+    # MoE teacher: the torch_dist checkpoint was saved with moe_layer_freq as a list
+    # ([1]*num_layers), which forces TransformerBlock.sharded_state_dict into the
+    # non_homogeneous (per-layer) `_extra_state` layout. The bridge rebuilds the provider
+    # with moe_layer_freq=int(1), which would instead pack `_extra_state` across all layers
+    # (shard_0_<num_layers>) and mismatch the checkpoint, crashing the load with
+    # "BytesIO has no len()". Normalize to a list so the load-side layout matches the saved one.
+    if getattr(provider, "num_moe_experts", None) and isinstance(getattr(provider, "moe_layer_freq", None), int):
+        provider.moe_layer_freq = [provider.moe_layer_freq] * provider.num_layers
     provider.finalize()
     return provider.provide
 

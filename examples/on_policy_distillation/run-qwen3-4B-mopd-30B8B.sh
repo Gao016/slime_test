@@ -1,9 +1,13 @@
 #!/bin/bash
 
-# Two-teacher heterogeneous full-vocab MOPD (full-length stress test, stage 1.1)
-# Teachers: Qwen3-32B + Qwen3-8B (both dense, independent resident models, torch_dist PP=1)
+# Two-teacher heterogeneous full-vocab MOPD (full-length stress test, stage 1.1).
+# Teachers: Qwen3-30B-A3B (128-expert MoE) + Qwen3-8B (dense), independent resident
+#           models, torch_dist PP=1. The 30B MoE teacher's build normalizes moe_layer_freq
+#           to a list so its per-layer torch_dist _extra_state loads (see model_provider.py).
 # Student:  Qwen3-4B (dense)
 # REVERSE KL (alpha=1.0, mode-seeking), full-vocab KL as auxiliary loss.
+# Uses 30B+8B instead of 32B+30B because two large teachers colocated OOM a 140GB card.
+# max-tokens-per-gpu lowered to 8192 (vs 32B+8B's 10240) for headroom with the MoE teacher.
 
 pkill -9 sglang
 sleep 3
@@ -37,7 +41,7 @@ MODEL_DIR="/mnt/amed-s1/common/ckpt/gaochang"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-4B/
    --ref-load ${MODEL_DIR}/Qwen3-4B/
-   # --save ${MODEL_DIR}/Qwen3-4B-OPD-hetero-output/
+   # --save ${MODEL_DIR}/Qwen3-4B-OPD-hetero-30b8b-output/
    # --save-interval 20
 )
 
@@ -57,6 +61,18 @@ ROLLOUT_ARGS=(
 
    --global-batch-size 256
    --balance-data
+
+   # Eval: accuracy on aime-2024 (deepscaler reward=1 => correct). resp_len must be
+   # large enough for Qwen3 thinking to finish <think>...</think> AND emit \boxed{};
+   # 2048 truncates mid-think (100% truncated -> acc always 0). Match train len 8192.
+   --eval-interval 10
+   --eval-prompt-data aime-2024 /personal/data/aime-2024.jsonl
+   --n-samples-per-eval-prompt 4
+   --eval-max-response-len 8192
+   --eval-max-prompt-len 2048
+   --eval-temperature 0.6
+   --eval-top-p 0.95
+   --eval-top-k 20
 )
 
 PERF_ARGS=(
@@ -72,7 +88,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 8192
 )
 
 GRPO_ARGS=(
@@ -84,23 +100,23 @@ GRPO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
 
-   # OPD + full-vocab KL, heterogeneous teacher
+   # OPD + full-vocab KL, heterogeneous teachers
    --use-opd
    --opd-type megatron
    --opd-kl-coef 1.0
    --opd-full-vocab-kl
    --opd-full-vocab-kl-alpha 1.0
-   --opd-full-vocab-kl-coef 0.1
+   --opd-full-vocab-kl-coef 1.0
    --opd-full-vocab-kl-tile-size 128
    --opd-hetero-teacher
 
-   # Single heterogeneous teacher (Qwen3-32B)
-   --megatron-config-path ${SCRIPT_DIR}/mopd_config_hetero_2t.yaml
+   # Dual heterogeneous teachers (Qwen3-30B-A3B MoE + Qwen3-8B dense)
+   --megatron-config-path ${SCRIPT_DIR}/mopd_config_30B8B.yaml
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr 1e-5
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9

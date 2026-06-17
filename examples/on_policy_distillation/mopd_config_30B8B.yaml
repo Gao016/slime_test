@@ -1,0 +1,25 @@
+# Heterogeneous full-vocab MOPD: two teachers (Qwen3-30B-A3B MoE + Qwen3-8B dense) ->
+# student Qwen3-4B (dense). All three share the same vocab (151936) so full-vocab KL is
+# well-defined; each teacher is built as an independent resident model from its own HF config.
+#
+# This pairs the 128-expert MoE teacher (30B-A3B) with a small dense teacher (8B) instead of
+# 32B+30B -- two large models colocated with the student on a 140GB card OOMs, but 30B+8B fits
+# (cf. the previously-verified 32B+8B run at ~107GB/card). teacher_0 (30B-A3B) is the MoE one;
+# its build_teacher_provider normalizes moe_layer_freq to a list so its per-layer torch_dist
+# `_extra_state` loads correctly (without it the load crashes with "BytesIO has no len()").
+#
+# `load` points at torch_dist (Megatron-native) checkpoints (both PP=1) so weights load via the
+# distributed-checkpoint path, NOT the HF bridge (which deadlocks on a 2nd teacher's TP-scatter).
+# `hf_checkpoint` points at the HF dir, used only to build the model architecture.
+# Names teacher_0 / teacher_1 match the keys used by compute_multi_teacher_kl_loss.
+megatron:
+  - role: teacher
+    name: teacher_0
+    overrides:
+      load: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-30B-A3B-tdst
+      hf_checkpoint: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-30B-A3B
+  - role: teacher
+    name: teacher_1
+    overrides:
+      load: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-8B-tdst
+      hf_checkpoint: /mnt/amed-s1/common/ckpt/gaochang/Qwen3-8B
