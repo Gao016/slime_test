@@ -88,7 +88,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 4096
 )
 
 GRPO_ARGS=(
